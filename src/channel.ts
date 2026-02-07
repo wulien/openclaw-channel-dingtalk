@@ -596,21 +596,35 @@ async function createAICard(
 
     const isGroup = conversationId.startsWith('cid');
 
+    // For IM_ROBOT single chat, use userId instead of conversationId
+    const spaceId = isGroup ? conversationId : (data.senderStaffId || data.senderId);
+
     // Build the createAndDeliver request body
     const createAndDeliverBody = {
       cardTemplateId: config.cardTemplateId || '382e4302-551d-4880-bf29-a30acfab2e71.schema',
       outTrackId: cardInstanceId,
       cardData: {
-        cardParamMap: {},
+        cardParamMap: {
+          content: '', // AI card requires initial content field for streaming updates
+        },
       },
       callbackType: 'STREAM',
       imGroupOpenSpaceModel: { supportForward: true },
       imRobotOpenSpaceModel: { supportForward: true },
-      openSpaceId: isGroup ? `dtv1.card//IM_GROUP.${conversationId}` : `dtv1.card//IM_ROBOT.${conversationId}`,
+      openSpaceId: isGroup ? `dtv1.card//IM_GROUP.${spaceId}` : `dtv1.card//IM_ROBOT.${spaceId}`,
       userIdType: 1,
       imGroupOpenDeliverModel: isGroup ? { robotCode: config.robotCode || config.clientId } : undefined,
-      imRobotOpenDeliverModel: !isGroup ? { spaceType: 'IM_ROBOT' } : undefined,
+      imRobotOpenDeliverModel: !isGroup ? { 
+        spaceType: 'IM_ROBOT',
+        robotCode: config.robotCode || config.clientId
+      } : undefined,
     };
+
+    // Debug: log sender IDs and request body
+    if (!isGroup) {
+      log?.info?.(`[AICard] Debug - senderStaffId: ${data.senderStaffId}, senderId: ${data.senderId}, conversationId: ${conversationId}`);
+      log?.info?.(`[AICard] Debug - Full request body: ${JSON.stringify(createAndDeliverBody, null, 2)}`);
+    }
 
     if (isGroup && !config.robotCode) {
       log?.warn?.(

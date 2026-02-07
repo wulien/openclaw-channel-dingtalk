@@ -463,6 +463,7 @@ export interface AICardDeliverRequest {
   };
   imRobotOpenDeliverModel?: {
     spaceType: string;
+    robotCode: string;
   };
 }
 
