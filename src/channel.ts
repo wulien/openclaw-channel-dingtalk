@@ -9,6 +9,7 @@ import { buildChannelConfigSchema } from 'openclaw/plugin-sdk';
 import { maskSensitiveData, cleanupOrphanedTempFiles, retryWithBackoff } from '../utils';
 import { getDingTalkRuntime } from './runtime';
 import { DingTalkConfigSchema } from './config-schema.js';
+import { monitorDingTalkStream } from './monitor.js';
 import { registerPeerId, resolveOriginalPeerId } from './peer-id-registry';
 import type {
   DingTalkConfig,
@@ -831,7 +832,7 @@ async function sendMessage(
 }
 
 // Message handler
-async function handleDingTalkMessage(params: HandleDingTalkMessageParams): Promise<void> {
+export async function handleDingTalkMessage(params: HandleDingTalkMessageParams): Promise<void> {
   const { cfg, accountId, data, sessionWebhook, log, dingtalkConfig } = params;
   const rt = getDingTalkRuntime();
 
@@ -1219,74 +1220,30 @@ export const dingtalkPlugin = {
     startAccount: async (ctx: GatewayStartContext): Promise<GatewayStopResult> => {
       const { account, cfg, abortSignal } = ctx;
       const config = account.config;
-      if (!config.clientId || !config.clientSecret) throw new Error('DingTalk clientId and clientSecret are required');
-      if (ctx.log?.info) {
-        ctx.log.info(`[${account.accountId}] Starting DingTalk Stream client...`);
+      if (!config.clientId || !config.clientSecret) {
+        throw new Error('DingTalk clientId and clientSecret are required');
       }
 
       cleanupOrphanedTempFiles(ctx.log);
 
-      const client = new DWClient({
-        clientId: config.clientId,
-        clientSecret: config.clientSecret,
-        debug: config.debug || false,
-        keepAlive: true,
+      ctx.log?.info?.(`[${account.accountId}] Starting DingTalk Stream with robust reconnection...`);
+
+      // Start monitoring in background with reconnection management
+      const monitorPromise = monitorDingTalkStream({
+        cfg,
+        accountId: account.accountId,
+        config,
+        abortSignal,
+        log: ctx.log,
       });
 
-      client.registerCallbackListener(TOPIC_ROBOT, async (res: any) => {
-        const messageId = res.headers?.messageId;
-        try {
-          if (messageId) {
-            client.socketCallBackResponse(messageId, { success: true });
-          }
-          const data = JSON.parse(res.data) as DingTalkInboundMessage;
-
-          // Message deduplication: skip if already processed
-          const dedupKey = data.msgId || messageId;
-          if (dedupKey && isMessageProcessed(dedupKey)) {
-            ctx.log?.debug?.(`[DingTalk] Skipping duplicate message: ${dedupKey}`);
-            return;
-          }
-          if (dedupKey) {
-            markMessageProcessed(dedupKey);
-          }
-
-          await handleDingTalkMessage({
-            cfg,
-            accountId: account.accountId,
-            data,
-            sessionWebhook: data.sessionWebhook,
-            log: ctx.log,
-            dingtalkConfig: config,
-          });
-        } catch (error: any) {
-          if (ctx.log?.error) {
-            ctx.log.error(`[DingTalk] Error processing message: ${error.message}`);
-          }
-        }
-      });
-
-      await client.connect();
-      if (ctx.log?.info) {
-        ctx.log.info(`[${account.accountId}] DingTalk Stream client connected`);
-      }
       let stopped = false;
-      if (abortSignal) {
-        abortSignal.addEventListener('abort', () => {
-          if (stopped) return;
-          stopped = true;
-          if (ctx.log?.info) {
-            ctx.log.info(`[${account.accountId}] Stopping DingTalk Stream client...`);
-          }
-        });
-      }
       return {
         stop: () => {
           if (stopped) return;
           stopped = true;
-          if (ctx.log?.info) {
-            ctx.log.info(`[${account.accountId}] DingTalk provider stopped`);
-          }
+          ctx.log?.info?.(`[${account.accountId}] DingTalk provider stop requested`);
+          // Monitor will stop via abortSignal
         },
       };
     },
