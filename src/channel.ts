@@ -155,6 +155,26 @@ function getLogger(): Logger | undefined {
   return currentLogger;
 }
 
+/**
+ * Safe log helper with console fallback for critical errors
+ * Ensures errors are always visible even if logger is not configured
+ */
+function safeLogError(log: Logger | undefined, message: string): void {
+  if (log?.error) {
+    log.error(message);
+  } else {
+    console.error(`[DingTalk] ${message}`);
+  }
+}
+
+function safeLogWarn(log: Logger | undefined, message: string): void {
+  if (log?.warn) {
+    log.warn(message);
+  } else {
+    console.warn(`[DingTalk] ${message}`);
+  }
+}
+
 // Helper function to detect markdown and extract title
 function detectMarkdownAndExtractTitle(
   text: string,
@@ -663,10 +683,12 @@ async function createAICard(
 
     return aiCardInstance;
   } catch (err: any) {
-    log?.error?.(`[DingTalk][AICard] Create failed: ${err.message}`);
+    const errorMsg = `[AICard] Create failed: ${err.message}`;
+    safeLogError(log, errorMsg);
     if (err.response) {
-      log?.error?.(
-        `[DingTalk][AICard] Error response: status=${err.response.status} data=${JSON.stringify(err.response.data)}`
+      safeLogError(
+        log,
+        `[AICard] Error response: status=${err.response.status} data=${JSON.stringify(err.response.data)}`
       );
     }
     return null;
@@ -807,17 +829,23 @@ async function sendMessage(
             await streamAICard(activeCard, text, false, log);
             return { ok: true };
           } catch (err: any) {
-            log?.warn?.(`[DingTalk] AI Card streaming failed, fallback to markdown: ${err.message}`);
+            // Fix: Do not fallback to markdown in card mode - return error directly
+            const errorMsg = `AI Card streaming failed: ${err.message}`;
+            safeLogError(log, errorMsg);
             activeCard.state = AICardStatus.FAILED;
             activeCard.lastUpdated = Date.now();
+            return { ok: false, error: err.message };
           }
         } else {
           activeCardsByTarget.delete(targetKey);
         }
       }
+      // If no active card found in card mode, log warning and return error
+      log?.warn?.('[DingTalk] Card mode enabled but no active card found');
+      return { ok: false, error: 'No active card found in card mode' };
     }
 
-    // Fallback to markdown mode
+    // Fallback to markdown mode (only when messageType !== 'card')
     if (options.sessionWebhook) {
       await sendBySession(config, options.sessionWebhook, text, options);
       return { ok: true };
@@ -826,7 +854,8 @@ async function sendMessage(
     const result = await sendProactiveTextOrMarkdown(config, conversationId, text, options);
     return { ok: true, data: result };
   } catch (err: any) {
-    options.log?.error?.(`[DingTalk] Send message failed: ${err.message}`);
+    const errorMsg = `Send message failed: ${err.message}`;
+    safeLogError(options.log, errorMsg);
     return { ok: false, error: err.message };
   }
 }
@@ -1004,12 +1033,36 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
     const existingCardId = activeCardsByTarget.get(targetKey);
     const existingCard = existingCardId ? aiCardInstances.get(existingCardId) : undefined;
 
-    // Only reuse cards that are not in terminal states
-    if (existingCard && !isCardInTerminalState(existingCard.state)) {
-      currentAICard = existingCard;
-      log?.debug?.('[DingTalk] Reusing existing active AI card for this conversation.');
-    } else {
-      // Create a new AI card
+    // Check for stale cards and force close them
+    if (existingCard) {
+      const cardAge = Date.now() - existingCard.createdAt;
+      const CARD_STALE_THRESHOLD = 5 * 60 * 1000; // 5 minutes
+      
+      if (!isCardInTerminalState(existingCard.state)) {
+        if (cardAge > CARD_STALE_THRESHOLD) {
+          // Stale card detected, force close it
+          log?.warn?.(`[DingTalk] Stale card detected (age=${Math.floor(cardAge / 1000)}s), forcing close`);
+          try {
+            await streamAICard(existingCard, '会话超时', true, log);
+          } catch (err: any) {
+            log?.debug?.(`[DingTalk] Failed to close stale card: ${err.message}`);
+          }
+          existingCard.state = AICardStatus.FAILED;
+          existingCard.lastUpdated = Date.now();
+          activeCardsByTarget.delete(targetKey);
+        } else {
+          // Valid active card, reuse it
+          currentAICard = existingCard;
+          log?.debug?.('[DingTalk] Reusing existing active AI card for this conversation.');
+        }
+      } else {
+        // Card is in terminal state, clean up mapping
+        activeCardsByTarget.delete(targetKey);
+      }
+    }
+
+    // Create a new AI card if we don't have a valid one
+    if (!currentAICard) {
       const aiCard = await createAICard(dingtalkConfig, to, data, accountId, log);
       if (aiCard) {
         currentAICard = aiCard;
@@ -1051,14 +1104,35 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
           if (!textToSend) return;
 
           lastCardContent = textToSend;
-          await sendMessage(dingtalkConfig, to, textToSend, {
-            sessionWebhook,
-            atUserId: !isDirect ? senderId : null,
-            log,
-            accountId,
-          });
+          
+          // In card mode, directly call streamAICard to avoid sendMessage's fallback logic
+          if (useCardMode && currentAICard && !isCardInTerminalState(currentAICard.state)) {
+            try {
+              await streamAICard(currentAICard, textToSend, false, log);
+            } catch (streamErr: any) {
+              const errorMsg = `Stream update failed: ${streamErr.message}`;
+              safeLogError(log, errorMsg);
+              // Mark card as failed but don't throw - let finalization handle cleanup
+              currentAICard.state = AICardStatus.FAILED;
+              currentAICard.lastUpdated = Date.now();
+            }
+          } else {
+            // Non-card mode or no active card, use regular sendMessage
+            await sendMessage(dingtalkConfig, to, textToSend, {
+              sessionWebhook,
+              atUserId: !isDirect ? senderId : null,
+              log,
+              accountId,
+            });
+          }
         } catch (err: any) {
-          log?.error?.(`[DingTalk] Reply failed: ${err.message}`);
+          const errorMsg = `Reply failed: ${err.message}`;
+          safeLogError(log, errorMsg);
+          // Mark card as failed in card mode
+          if (useCardMode && currentAICard) {
+            currentAICard.state = AICardStatus.FAILED;
+            currentAICard.lastUpdated = Date.now();
+          }
           throw err;
         }
       },
@@ -1067,6 +1141,7 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
 
   // Finalize AI card
   if (useCardMode && currentAICard) {
+    const targetKey = `${accountId}:${to}`;
     try {
       // Helper function to check if a value is a non-empty string
       const isNonEmptyString = (value: any): boolean =>
@@ -1080,25 +1155,36 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
         const finalContent = hasLastCardContent ? lastCardContent : (queuedFinal as string);
         await finishAICard(currentAICard, finalContent, log);
       } else {
-        // No textual content was produced; skip finalization with empty content
+        // No textual content was produced; still need to close the card to prevent spinning
         log?.debug?.(
-          '[DingTalk] Skipping AI Card finalization because no textual content was produced.'
+          '[DingTalk] No textual content produced, closing card with placeholder'
         );
-        // Still mark the card as finished to allow cleanup
+        try {
+          // Send a finalize message to close the streaming channel
+          await streamAICard(currentAICard, '处理完成', true, log);
+        } catch (finalizeErr: any) {
+          log?.warn?.(`[DingTalk] Failed to close empty card: ${finalizeErr.message}`);
+        }
+        // Always update state to FINISHED
         currentAICard.state = AICardStatus.FINISHED;
         currentAICard.lastUpdated = Date.now();
       }
     } catch (err: any) {
-      log?.debug?.(`[DingTalk] AI Card finalization failed: ${err.message}`);
+      const errorMsg = `AI Card finalization failed: ${err.message}`;
+      safeLogError(log, errorMsg);
       // Ensure the AI card transitions to a terminal error state
       try {
         if (currentAICard.state !== AICardStatus.FINISHED) {
           currentAICard.state = AICardStatus.FAILED;
           currentAICard.lastUpdated = Date.now();
         }
+        // Clean up active card mapping to prevent reuse of failed cards
+        activeCardsByTarget.delete(targetKey);
+        log?.debug?.(`[DingTalk] Cleaned up failed card mapping: ${targetKey}`);
       } catch (stateErr: any) {
         // Log state update failure at debug level to aid production debugging
         log?.debug?.(`[DingTalk] Failed to update card state to FAILED: ${stateErr.message}`);
+        console.error(`[DingTalk] Failed to update card state:`, stateErr);
       }
     }
   }
