@@ -154,6 +154,8 @@ export async function monitorDingTalkStream(opts: DingTalkMonitorOpts): Promise<
       // Register message callback
       client.registerCallbackListener(TOPIC_ROBOT, async (res: any) => {
         const messageId = res.headers?.messageId;
+        log?.info?.(`[${accountId}] 📨 Received callback from DingTalk Stream (messageId=${messageId || 'unknown'})`);
+        
         try {
           handledMessages += 1;
           lastMessageAt = Date.now();
@@ -165,6 +167,8 @@ export async function monitorDingTalkStream(opts: DingTalkMonitorOpts): Promise<
 
           const data = JSON.parse(res.data);
           const dedupKey = data.msgId || messageId;
+          
+          log?.info?.(`[${accountId}] 📋 Message data parsed - dedupKey=${dedupKey}, conversationType=${data.conversationType || 'unknown'}, senderNick=${data.senderNick || 'unknown'}`);
 
           if (dedupKey && isMessageProcessed(dedupKey)) {
             log?.debug?.(`[${accountId}] Skipping duplicate message: ${dedupKey}`);
@@ -174,6 +178,7 @@ export async function monitorDingTalkStream(opts: DingTalkMonitorOpts): Promise<
             markMessageProcessed(dedupKey);
           }
 
+          log?.info?.(`[${accountId}] 🚀 Dispatching message to handleDingTalkMessage`);
           await handleDingTalkMessage({
             cfg,
             accountId,
@@ -182,18 +187,21 @@ export async function monitorDingTalkStream(opts: DingTalkMonitorOpts): Promise<
             log,
             dingtalkConfig: config as any, // Config validated above, clientId/clientSecret guaranteed to exist
           });
+          log?.info?.(`[${accountId}] ✅ Message handled successfully (dedupKey=${dedupKey})`);
         } catch (error: any) {
-          log?.error?.(`[${accountId}] Error processing message: ${error.message}`);
+          log?.error?.(`[${accountId}] ❌ Error processing message: ${error.message}, stack: ${error.stack}`);
         }
       });
 
       // Connect to DingTalk Stream
+      log?.info?.(`[${accountId}] 🔌 Attempting to connect to DingTalk Stream (clientId=${config.clientId?.slice(0, 8)}...)`);
       await client.connect();
 
       status.connected = true;
       status.lastConnectedAt = Date.now();
       status.lastError = null;
-      log?.info?.(`[${accountId}] DingTalk Stream connected successfully`);
+      log?.info?.(`[${accountId}] ✅ DingTalk Stream connected successfully (connection ${connectionId.slice(0, 8)})`);
+      log?.info?.(`[${accountId}] 👂 Listening for messages on TOPIC_ROBOT...`);
 
       // Start heartbeat monitoring
       heartbeat = setInterval(() => {
@@ -274,12 +282,14 @@ export async function monitorDingTalkStream(opts: DingTalkMonitorOpts): Promise<
         error: errorMsg,
       };
 
-      log?.error?.(`[${accountId}] Connection failed: ${errorMsg}`);
+      log?.error?.(`[${accountId}] ❌ Connection failed: ${errorMsg}`);
+      log?.error?.(`[${accountId}] 📊 Connection stats - uptime: ${Math.floor((Date.now() - startedAt) / 1000)}s, messages handled: ${handledMessages}, last message: ${lastMessageAt ? new Date(lastMessageAt).toISOString() : 'never'}`);
 
       await closeConnection();
+      log?.info?.(`[${accountId}] 🔌 Connection closed after failure`);
 
       if (stopRequested()) {
-        log?.info?.(`[${accountId}] Stop requested, exiting after error`);
+        log?.info?.(`[${accountId}] ⏹️ Stop requested, exiting after error`);
         break;
       }
 
@@ -287,7 +297,7 @@ export async function monitorDingTalkStream(opts: DingTalkMonitorOpts): Promise<
       const uptimeMs = Date.now() - startedAt;
       if (uptimeMs > heartbeatSeconds * 1000) {
         log?.info?.(
-          `[${accountId}] Had healthy uptime (${Math.floor(uptimeMs / 1000)}s) before failure, resetting reconnect counter`
+          `[${accountId}] ✅ Had healthy uptime (${Math.floor(uptimeMs / 1000)}s) before failure, resetting reconnect counter`
         );
         reconnectAttempts = 0;
       }
@@ -295,10 +305,12 @@ export async function monitorDingTalkStream(opts: DingTalkMonitorOpts): Promise<
       reconnectAttempts += 1;
       status.reconnectAttempts = reconnectAttempts;
 
+      log?.warn?.(`[${accountId}] 🔄 Reconnection attempt ${reconnectAttempts}/${reconnectPolicy.maxAttempts || "∞"} - last error: ${errorMsg}`);
+
       // Check max attempts
       if (reconnectPolicy.maxAttempts > 0 && reconnectAttempts >= reconnectPolicy.maxAttempts) {
         log?.error?.(
-          `[${accountId}] Max reconnection attempts reached (${reconnectAttempts}/${reconnectPolicy.maxAttempts}), stopping`
+          `[${accountId}] 🛑 Max reconnection attempts reached (${reconnectAttempts}/${reconnectPolicy.maxAttempts}), stopping`
         );
         break;
       }
@@ -306,14 +318,15 @@ export async function monitorDingTalkStream(opts: DingTalkMonitorOpts): Promise<
       // Compute exponential backoff delay
       const delay = computeBackoff(reconnectPolicy, reconnectAttempts);
       log?.info?.(
-        `[${accountId}] Retry ${reconnectAttempts}/${reconnectPolicy.maxAttempts || "∞"} in ${Math.floor(delay / 1000)}s...`
+        `[${accountId}] ⏳ Retry ${reconnectAttempts}/${reconnectPolicy.maxAttempts || "∞"} in ${Math.floor(delay / 1000)}s... (backoff policy: base=${reconnectPolicy.baseDelayMs}ms, max=${reconnectPolicy.maxDelayMs}ms)`
       );
 
       // Sleep with abort check
       try {
         await sleepWithAbort(delay, abortSignal);
+        log?.info?.(`[${accountId}] ⏰ Backoff completed, attempting reconnection...`);
       } catch {
-        log?.info?.(`[${accountId}] Sleep interrupted, exiting reconnection loop`);
+        log?.info?.(`[${accountId}] ⏹️ Sleep interrupted, exiting reconnection loop`);
         break;
       }
     }

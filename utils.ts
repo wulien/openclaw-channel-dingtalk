@@ -81,6 +81,7 @@ export function cleanupOrphanedTempFiles(log?: Logger): number {
 /**
  * Retry logic for API calls with exponential backoff
  * Handles transient failures like 401 token expiry
+ * Now includes timeout support for axios requests
  */
 export async function retryWithBackoff<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
   const { maxRetries = 3, baseDelayMs = 100, log } = options;
@@ -90,14 +91,16 @@ export async function retryWithBackoff<T>(fn: () => Promise<T>, options: RetryOp
       return await fn();
     } catch (err: any) {
       const statusCode = err.response?.status;
-      const isRetryable = statusCode === 401 || statusCode === 429 || (statusCode && statusCode >= 500);
+      const isTimeout = err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT';
+      const isRetryable = isTimeout || statusCode === 401 || statusCode === 429 || (statusCode && statusCode >= 500);
 
       if (!isRetryable || attempt === maxRetries) {
         throw err;
       }
 
       const delayMs = baseDelayMs * Math.pow(2, attempt - 1);
-      log?.debug?.(`[DingTalk] Retry attempt ${attempt}/${maxRetries} after ${delayMs}ms`);
+      const reason = isTimeout ? 'timeout' : `HTTP ${statusCode}`;
+      log?.debug?.(`[DingTalk] Retry attempt ${attempt}/${maxRetries} after ${delayMs}ms (reason: ${reason})`);
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }

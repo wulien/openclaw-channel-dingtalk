@@ -53,6 +53,11 @@ const CARD_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 // DingTalk API base URL
 const DINGTALK_API = 'https://api.dingtalk.com';
 
+// HTTP request timeout and retry configuration
+const HTTP_TIMEOUT_MS = 10000; // 10 seconds
+const HTTP_MAX_RETRIES = 3;
+const HTTP_RETRY_BASE_DELAY_MS = 100;
+
 // ============ Message Deduplication ============
 // Prevents duplicate message processing when DingTalk retries delivery
 
@@ -348,6 +353,8 @@ async function getAccessToken(config: DingTalkConfig, log?: Logger): Promise<str
       const response = await axios.post<TokenInfo>('https://api.dingtalk.com/v1.0/oauth2/accessToken', {
         appKey: config.clientId,
         appSecret: config.clientSecret,
+      }, {
+        timeout: HTTP_TIMEOUT_MS,
       });
 
       // Store in cache with clientId as key
@@ -406,12 +413,16 @@ async function sendProactiveTextOrMarkdown(
     payload.userIds = [resolvedTarget];
   }
 
-  const result = await axios({
-    url,
-    method: 'POST',
-    data: payload,
-    headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' },
-  });
+  const result = await retryWithBackoff(
+    async () => await axios({
+      url,
+      method: 'POST',
+      data: payload,
+      headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' },
+      timeout: HTTP_TIMEOUT_MS,
+    }),
+    { maxRetries: HTTP_MAX_RETRIES, baseDelayMs: HTTP_RETRY_BASE_DELAY_MS, log }
+  );
   return result.data;
 }
 
@@ -450,7 +461,10 @@ async function downloadMedia(
     const response = await axios.post(
       'https://api.dingtalk.com/v1.0/robot/messageFiles/download',
       { downloadCode, robotCode: config.robotCode },
-      { headers: { 'x-acs-dingtalk-access-token': token } }
+      { 
+        headers: { 'x-acs-dingtalk-access-token': token },
+        timeout: HTTP_TIMEOUT_MS,
+      }
     );
     const payload = response.data as Record<string, any>;
     const downloadUrl = payload?.downloadUrl ?? payload?.data?.downloadUrl;
@@ -461,7 +475,10 @@ async function downloadMedia(
       );
       return null;
     }
-    const mediaResponse = await axios.get(downloadUrl, { responseType: 'arraybuffer' });
+    const mediaResponse = await axios.get(downloadUrl, { 
+      responseType: 'arraybuffer',
+      timeout: HTTP_TIMEOUT_MS,
+    });
     const contentType = mediaResponse.headers['content-type'] || 'application/octet-stream';
     const buffer = Buffer.from(mediaResponse.data as ArrayBuffer);
 
@@ -580,12 +597,16 @@ async function sendBySession(
 
   if (options.atUserId) body.at = { atUserIds: [options.atUserId], isAtAll: false };
 
-  const result = await axios({
-    url: sessionWebhook,
-    method: 'POST',
-    data: body,
-    headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' },
-  });
+  const result = await retryWithBackoff(
+    async () => await axios({
+      url: sessionWebhook,
+      method: 'POST',
+      data: body,
+      headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' },
+      timeout: HTTP_TIMEOUT_MS,
+    }),
+    { maxRetries: HTTP_MAX_RETRIES, baseDelayMs: HTTP_RETRY_BASE_DELAY_MS, log: options.log }
+  );
   return result.data;
 }
 
@@ -657,9 +678,13 @@ async function createAICard(
     log?.debug?.(
       `[DingTalk][AICard] POST /v1.0/card/instances/createAndDeliver body=${JSON.stringify(createAndDeliverBody)}`
     );
-    const resp = await axios.post(`${DINGTALK_API}/v1.0/card/instances/createAndDeliver`, createAndDeliverBody, {
-      headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' },
-    });
+    const resp = await retryWithBackoff(
+      async () => await axios.post(`${DINGTALK_API}/v1.0/card/instances/createAndDeliver`, createAndDeliverBody, {
+        headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' },
+        timeout: HTTP_TIMEOUT_MS,
+      }),
+      { maxRetries: HTTP_MAX_RETRIES, baseDelayMs: HTTP_RETRY_BASE_DELAY_MS, log }
+    );
     log?.debug?.(
       `[DingTalk][AICard] CreateAndDeliver response: status=${resp.status} data=${JSON.stringify(resp.data)}`
     );
@@ -740,9 +765,13 @@ async function streamAICard(
   );
 
   try {
-    const streamResp = await axios.put(`${DINGTALK_API}/v1.0/card/streaming`, streamBody, {
-      headers: { 'x-acs-dingtalk-access-token': card.accessToken, 'Content-Type': 'application/json' },
-    });
+    const streamResp = await retryWithBackoff(
+      async () => await axios.put(`${DINGTALK_API}/v1.0/card/streaming`, streamBody, {
+        headers: { 'x-acs-dingtalk-access-token': card.accessToken, 'Content-Type': 'application/json' },
+        timeout: HTTP_TIMEOUT_MS,
+      }),
+      { maxRetries: HTTP_MAX_RETRIES, baseDelayMs: HTTP_RETRY_BASE_DELAY_MS, log }
+    );
     log?.debug?.(
       `[DingTalk][AICard] Streaming response: status=${streamResp.status}, data=${JSON.stringify(streamResp.data)}`
     );
@@ -763,6 +792,7 @@ async function streamAICard(
         // Retry the streaming request with refreshed token
         const retryResp = await axios.put(`${DINGTALK_API}/v1.0/card/streaming`, streamBody, {
           headers: { 'x-acs-dingtalk-access-token': card.accessToken, 'Content-Type': 'application/json' },
+          timeout: HTTP_TIMEOUT_MS,
         });
         log?.debug?.(
           `[DingTalk][AICard] Retry after token refresh succeeded: status=${retryResp.status}`
@@ -868,6 +898,7 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
   // Save logger reference globally for use by other methods
   currentLogger = log;
 
+  log?.info?.(`[dingtalk] 🔔 handleDingTalkMessage CALLED - msgId=${data.msgId}, conversationType=${data.conversationType}, senderNick=${data.senderNick}`);
   log?.debug?.('[DingTalk] Full Inbound Data:', JSON.stringify(maskSensitiveData(data)));
 
   // 0. 清理过期的卡片缓存
@@ -1063,11 +1094,22 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
 
     // Create a new AI card if we don't have a valid one
     if (!currentAICard) {
-      const aiCard = await createAICard(dingtalkConfig, to, data, accountId, log);
-      if (aiCard) {
-        currentAICard = aiCard;
-      } else {
-        log?.warn?.('[DingTalk] Failed to create AI card, fallback to text/markdown.');
+      try {
+        const aiCard = await createAICard(dingtalkConfig, to, data, accountId, log);
+        if (aiCard) {
+          currentAICard = aiCard;
+        } else {
+          log?.warn?.('[DingTalk] Failed to create AI card, will notify user with fallback message.');
+        }
+      } catch (createErr: any) {
+        const errorMsg = `创建消息卡片失败：${createErr.message}。正在切换到文本模式...`;
+        safeLogError(log, `[AICard] Create failed with error: ${createErr.message}`);
+        // Notify user about the failure with a fallback text message
+        try {
+          await sendBySession(dingtalkConfig, sessionWebhook, `⚠️ ${errorMsg}`, { log });
+        } catch (fallbackErr: any) {
+          safeLogError(log, `[AICard] Fallback notification also failed: ${fallbackErr.message}`);
+        }
       }
     }
   }
@@ -1110,11 +1152,20 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
             try {
               await streamAICard(currentAICard, textToSend, false, log);
             } catch (streamErr: any) {
-              const errorMsg = `Stream update failed: ${streamErr.message}`;
-              safeLogError(log, errorMsg);
-              // Mark card as failed but don't throw - let finalization handle cleanup
+              const errorMsg = `流式更新失败：${streamErr.message}`;
+              safeLogError(log, `[AICard] ${errorMsg}`);
+              // Mark card as failed and send fallback notification
               currentAICard.state = AICardStatus.FAILED;
               currentAICard.lastUpdated = Date.now();
+              // Notify user about the streaming failure
+              try {
+                await sendBySession(dingtalkConfig, sessionWebhook, 
+                  `⚠️ 消息卡片更新失败，正在重试...\n\n原始回复：\n${textToSend}`, 
+                  { log, atUserId: !isDirect ? senderId : null }
+                );
+              } catch (fallbackErr: any) {
+                safeLogError(log, `[AICard] Fallback message also failed: ${fallbackErr.message}`);
+              }
             }
           } else {
             // Non-card mode or no active card, use regular sendMessage
@@ -1153,7 +1204,20 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
 
       if (hasLastCardContent || hasQueuedFinalString) {
         const finalContent = hasLastCardContent ? lastCardContent : (queuedFinal as string);
-        await finishAICard(currentAICard, finalContent, log);
+        try {
+          await finishAICard(currentAICard, finalContent, log);
+        } catch (finishErr: any) {
+          safeLogError(log, `[AICard] Finalization failed: ${finishErr.message}`);
+          // Attempt to notify user about the failure with fallback message
+          try {
+            await sendBySession(dingtalkConfig, sessionWebhook,
+              `⚠️ 消息发送过程中出现问题\n\n完整回复内容：\n${finalContent}`,
+              { log, atUserId: !isDirect ? senderId : null }
+            );
+          } catch (fallbackErr: any) {
+            safeLogError(log, `[AICard] Final fallback notification failed: ${fallbackErr.message}`);
+          }
+        }
       } else {
         // No textual content was produced; still need to close the card to prevent spinning
         log?.debug?.(
