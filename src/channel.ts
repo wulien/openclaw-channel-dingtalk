@@ -1328,12 +1328,12 @@ export const dingtalkPlugin = {
   },
   outbound: {
     deliveryMode: 'direct',
-    resolveTarget: ({ to }: any) => {
-      const trimmed = to?.trim();
+    resolveTarget: ({ target }: any) => {
+      const trimmed = target?.trim();
       if (!trimmed) {
         return {
           ok: false,
-          error: new Error('DingTalk message requires --to <conversationId>'),
+          error: new Error('DingTalk message requires target (conversationId)'),
         };
       }
       // Strip group: or user: prefix and resolve original case-sensitive conversationId
@@ -1341,24 +1341,24 @@ export const dingtalkPlugin = {
       const resolved = resolveOriginalPeerId(targetId);
       return { ok: true, to: resolved };
     },
-    sendText: async ({ cfg, to, text, accountId, log }: any) => {
+    sendText: async ({ cfg, target, text, accountId, log }: any) => {
       const config = getConfig(cfg, accountId);
       try {
-        const result = await sendMessage(config, to, text, { log, accountId });
+        const result = await sendMessage(config, target, text, { log, accountId });
         getLogger()?.debug?.(`[DingTalk] sendText: "${text}" result: ${JSON.stringify(result)}`);
         return result.ok ? { ok: true, data: result.data } : { ok: false, error: result.error };
       } catch (err: any) {
         return { ok: false, error: err.response?.data || err.message };
       }
     },
-    sendMedia: async ({ cfg, to, mediaPath, accountId, log }: any) => {
+    sendMedia: async ({ cfg, target, mediaPath, accountId, log }: any) => {
       const config = getConfig(cfg, accountId);
       if (!config.clientId) {
         return { ok: false, error: 'DingTalk not configured' };
       }
       try {
         const mediaDescription = `[媒体消息（暂不支持直发）: ${mediaPath}]`;
-        const result = await sendMessage(config, to, mediaDescription, { log, accountId });
+        const result = await sendMessage(config, target, mediaDescription, { log, accountId });
         getLogger()?.debug?.(`[DingTalk] sendMedia: "${mediaDescription}" result: ${JSON.stringify(result)}`);
         return result.ok ? { ok: true, data: result.data } : { ok: false, error: result.error };
       } catch (err: any) {
