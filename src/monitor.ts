@@ -114,6 +114,8 @@ export async function monitorDingTalkStream(opts: DingTalkMonitorOpts): Promise<
     const MESSAGE_TIMEOUT_MS = 30 * 60 * 1000;
     const WATCHDOG_CHECK_MS = 60 * 1000; // Check every minute
 
+    let forceReconnect: ((reason: string) => void) | null = null;
+
     const closeConnection = async () => {
       if (connectionClosed) return;
       connectionClosed = true;
@@ -220,6 +222,17 @@ export async function monitorDingTalkStream(opts: DingTalkMonitorOpts): Promise<
             : {}),
         };
 
+        // Check if client object is still valid (basic health check)
+        if (!client) {
+          log?.error?.(
+            `[${accountId}] 💔 Heartbeat: client object is null - forcing reconnect`
+          );
+          if (forceReconnect) {
+            forceReconnect('Client object became null during runtime');
+          }
+          return;
+        }
+
         if (minutesSinceLastMessage && minutesSinceLastMessage > 30) {
           log?.warn?.(
             `[${accountId}] ⚠️ Heartbeat: no messages in ${minutesSinceLastMessage} minutes (${JSON.stringify(logData)})`
@@ -239,18 +252,31 @@ export async function monitorDingTalkStream(opts: DingTalkMonitorOpts): Promise<
         if (timeSinceLastMessage > MESSAGE_TIMEOUT_MS) {
           const minutesSinceLastMessage = Math.floor(timeSinceLastMessage / 60000);
           log?.warn?.(
-            `[${accountId}] Watchdog: No messages in ${minutesSinceLastMessage} minutes - forcing reconnect`
+            `[${accountId}] 🐕 Watchdog: No messages in ${minutesSinceLastMessage} minutes - forcing reconnect`
           );
-          void closeConnection();
+          
+          // Force reconnection by rejecting the wait Promise
+          if (forceReconnect) {
+            forceReconnect(
+              `Watchdog timeout: no messages for ${minutesSinceLastMessage} minutes`
+            );
+          }
         }
       }, WATCHDOG_CHECK_MS);
 
-      // Wait for abort signal
-      await new Promise<void>((resolve) => {
+      // Wait for abort signal or forced reconnection
+      await new Promise<void>((resolve, reject) => {
         if (stopRequested()) {
           resolve();
           return;
         }
+        
+        // Set up forced reconnection handler
+        forceReconnect = (reason: string) => {
+          log?.warn?.(`[${accountId}] 💥 Forced reconnection: ${reason}`);
+          reject(new Error(reason));
+        };
+        
         const onAbort = () => {
           log?.info?.(`[${accountId}] Abort signal received`);
           resolve();
