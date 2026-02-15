@@ -1134,7 +1134,7 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
   }
 
   // Add timeout protection for AI processing
-  const AI_RESPONSE_TIMEOUT_MS = 120000; // 2 minutes timeout
+  const AI_RESPONSE_TIMEOUT_MS = 300000; // 5 minutes timeout
   let timeoutHandle: NodeJS.Timeout | null = null;
   let hasTimedOut = false;
 
@@ -1142,7 +1142,7 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
     timeoutHandle = setTimeout(async () => {
       if (currentAICard && !isCardInTerminalState(currentAICard.state)) {
         hasTimedOut = true;
-        log?.warn?.('[DingTalk] AI response timeout (2 minutes), closing card with error message');
+        log?.warn?.('[DingTalk] AI response timeout (5 minutes), closing card with error message');
 
         try {
           // Close the card with error message
