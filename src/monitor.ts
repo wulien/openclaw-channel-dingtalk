@@ -104,15 +104,10 @@ export async function monitorDingTalkStream(opts: DingTalkMonitorOpts): Promise<
     const connectionId = newConnectionId();
     const startedAt = Date.now();
     let heartbeat: NodeJS.Timeout | null = null;
-    let watchdogTimer: NodeJS.Timeout | null = null;
     let lastMessageAt: number | null = null;
     let handledMessages = 0;
     let client: DWClient | null = null;
     let connectionClosed = false;
-
-    // Watchdog to detect stuck connection (30 min without messages)
-    const MESSAGE_TIMEOUT_MS = 30 * 60 * 1000;
-    const WATCHDOG_CHECK_MS = 60 * 1000; // Check every minute
 
     let forceReconnect: ((reason: string) => void) | null = null;
 
@@ -124,10 +119,7 @@ export async function monitorDingTalkStream(opts: DingTalkMonitorOpts): Promise<
         clearInterval(heartbeat);
         heartbeat = null;
       }
-      if (watchdogTimer) {
-        clearInterval(watchdogTimer);
-        watchdogTimer = null;
-      }
+
       if (client) {
         try {
           // DWClient has disconnect method but it's not exposed, so we just null it
@@ -146,11 +138,15 @@ export async function monitorDingTalkStream(opts: DingTalkMonitorOpts): Promise<
         throw new Error('DingTalk clientId and clientSecret are required');
       }
 
+      // Note: dingtalk-stream has a critical bug where socket.terminate() 
+      // in heartbeat timeout handler doesn't trigger 'close' event, breaking
+      // the library's autoReconnect mechanism. We disable library keepAlive
+      // and implement our own ping/pong with proper reconnection.
       client = new DWClient({
         clientId: config.clientId,
         clientSecret: config.clientSecret,
         debug: config.debug || false,
-        keepAlive: true,
+        keepAlive: false, // Disabled: we handle ping/pong ourselves
       });
 
       // Register message callback
@@ -205,64 +201,73 @@ export async function monitorDingTalkStream(opts: DingTalkMonitorOpts): Promise<
       log?.info?.(`[${accountId}] ✅ DingTalk Stream connected successfully (connection ${connectionId.slice(0, 8)})`);
       log?.info?.(`[${accountId}] 👂 Listening for messages on TOPIC_ROBOT...`);
 
-      // Start heartbeat monitoring
+      // Start heartbeat with real ping/pong detection
+      let pongReceived = true; // Start as true for first check
+      const PING_INTERVAL_MS = heartbeatSeconds * 1000; // 30s between pings
+      const PONG_TIMEOUT_MS = 10_000; // 10s to receive pong back
+
+      // Listen for pong responses on the underlying WebSocket
+      const setupPongListener = () => {
+        const ws = (client as any)?.socket;
+        if (ws && typeof ws.on === 'function') {
+          ws.on('pong', () => {
+            pongReceived = true;
+            log?.info?.(`[${accountId}] 🏓 Pong received`);
+          });
+          log?.info?.(`[${accountId}] 🏓 Ping/pong listener attached to WebSocket`);
+        } else {
+          log?.warn?.(`[${accountId}] ⚠️ Could not access underlying WebSocket for ping/pong`);
+        }
+      };
+
+      // Attach pong listener after a short delay (WebSocket needs time to initialize)
+      setTimeout(setupPongListener, 1000);
+
       heartbeat = setInterval(() => {
         const uptimeMs = Date.now() - startedAt;
         const minutesSinceLastMessage = lastMessageAt
           ? Math.floor((Date.now() - lastMessageAt) / 60000)
           : null;
 
-        const logData = {
-          connectionId: connectionId.slice(0, 8),
-          reconnectAttempts,
-          messagesHandled: handledMessages,
-          uptimeMs,
-          ...(minutesSinceLastMessage !== null && minutesSinceLastMessage > 30
-            ? { minutesSinceLastMessage }
-            : {}),
-        };
-
-        // Check if client object is still valid (basic health check)
+        // Check if client object is still valid
         if (!client) {
-          log?.error?.(
-            `[${accountId}] 💔 Heartbeat: client object is null - forcing reconnect`
-          );
-          if (forceReconnect) {
-            forceReconnect('Client object became null during runtime');
-          }
+          log?.error?.(`[${accountId}] 💔 Heartbeat: client is null - forcing reconnect`);
+          if (forceReconnect) forceReconnect('Client object became null');
           return;
         }
 
-        if (minutesSinceLastMessage && minutesSinceLastMessage > 30) {
-          log?.warn?.(
-            `[${accountId}] ⚠️ Heartbeat: no messages in ${minutesSinceLastMessage} minutes (${JSON.stringify(logData)})`
-          );
+        // Check previous ping got a pong back
+        if (!pongReceived) {
+          log?.warn?.(`[${accountId}] 💀 Heartbeat: No pong received - zombie connection detected, forcing reconnect`);
+          if (forceReconnect) forceReconnect('Ping/pong timeout: no pong received');
+          return;
+        }
+
+        // Check if we haven't received any messages for too long (possible message channel issue)
+        // Only check after we've received at least one message
+        const MESSAGE_IDLE_THRESHOLD_MINUTES = 15;
+        if (lastMessageAt && minutesSinceLastMessage !== null && minutesSinceLastMessage >= MESSAGE_IDLE_THRESHOLD_MINUTES) {
+          log?.warn?.(`[${accountId}] 📭 No messages received for ${minutesSinceLastMessage} minutes - possible message channel issue, forcing reconnect`);
+          if (forceReconnect) forceReconnect(`No messages for ${minutesSinceLastMessage} minutes`);
+          return;
+        }
+
+        // Send new ping
+        const ws = (client as any)?.socket;
+        if (ws && typeof ws.ping === 'function' && ws.readyState === 1) {
+          pongReceived = false; // Will be set to true when pong comes back
+          ws.ping('', true);
+          log?.info?.(`[${accountId}] 🏓 Ping sent`);
         } else {
-          log?.debug?.(
-            `[${accountId}] Heartbeat: ${handledMessages} messages, uptime ${Math.floor(uptimeMs / 1000)}s`
-          );
+          log?.warn?.(`[${accountId}] 💀 Heartbeat: WebSocket not available or not open (readyState=${ws?.readyState}) - forcing reconnect`);
+          if (forceReconnect) forceReconnect('WebSocket not available or closed');
+          return;
         }
-      }, heartbeatSeconds * 1000);
 
-      // Start watchdog timer to detect zombie connections
-      watchdogTimer = setInterval(() => {
-        if (!lastMessageAt) return;
-
-        const timeSinceLastMessage = Date.now() - lastMessageAt;
-        if (timeSinceLastMessage > MESSAGE_TIMEOUT_MS) {
-          const minutesSinceLastMessage = Math.floor(timeSinceLastMessage / 60000);
-          log?.warn?.(
-            `[${accountId}] 🐕 Watchdog: No messages in ${minutesSinceLastMessage} minutes - forcing reconnect`
-          );
-          
-          // Force reconnection by rejecting the wait Promise
-          if (forceReconnect) {
-            forceReconnect(
-              `Watchdog timeout: no messages for ${minutesSinceLastMessage} minutes`
-            );
-          }
-        }
-      }, WATCHDOG_CHECK_MS);
+        log?.info?.(
+          `[${accountId}] 💓 Heartbeat OK: ${handledMessages} msgs, uptime ${Math.floor(uptimeMs / 1000)}s${minutesSinceLastMessage !== null ? `, last msg ${minutesSinceLastMessage}m ago` : ''}`
+        );
+      }, PING_INTERVAL_MS);
 
       // Wait for abort signal or forced reconnection
       await new Promise<void>((resolve, reject) => {
