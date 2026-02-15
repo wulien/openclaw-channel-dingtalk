@@ -859,23 +859,21 @@ async function sendMessage(
             await streamAICard(activeCard, text, false, log);
             return { ok: true };
           } catch (err: any) {
-            // Fix: Do not fallback to markdown in card mode - return error directly
-            const errorMsg = `AI Card streaming failed: ${err.message}`;
-            safeLogError(log, errorMsg);
+            // AI Card streaming failed, fallback to markdown
+            log?.warn?.(`[DingTalk] AI Card streaming failed, falling back to markdown: ${err.message}`);
             activeCard.state = AICardStatus.FAILED;
             activeCard.lastUpdated = Date.now();
-            return { ok: false, error: err.message };
+            // Continue execution, fallback to markdown
           }
         } else {
           activeCardsByTarget.delete(targetKey);
         }
       }
-      // If no active card found in card mode, log warning and return error
-      log?.warn?.('[DingTalk] Card mode enabled but no active card found');
-      return { ok: false, error: 'No active card found in card mode' };
+      // No active card found, fallback to markdown instead of returning error
+      log?.info?.('[DingTalk] No active card found, falling back to markdown proactive message');
     }
 
-    // Fallback to markdown mode (only when messageType !== 'card')
+    // Markdown mode or fallback handling
     if (options.sessionWebhook) {
       await sendBySession(config, options.sessionWebhook, text, options);
       return { ok: true };
@@ -1257,6 +1255,34 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
 }
 
 // DingTalk Channel Definition
+// Monkey-patch applyTargetToParams to fix empty string bug
+// 这是临时方案，直到 OpenClaw 官方修复此 bug
+try {
+  const channelTargetModule = await import('../../infra/outbound/channel-target.js');
+  if (channelTargetModule && typeof channelTargetModule.applyTargetToParams === 'function') {
+    const originalApplyTargetToParams = channelTargetModule.applyTargetToParams;
+    channelTargetModule.applyTargetToParams = function patchedApplyTargetToParams(params: {
+      action: string;
+      args: Record<string, unknown>;
+    }): void {
+      // 清理空字符串的 to/channelId，避免被误认为 legacy 参数
+      if (params.args) {
+        if (typeof params.args.to === 'string' && params.args.to.trim() === '') {
+          delete params.args.to;
+        }
+        if (typeof params.args.channelId === 'string' && (params.args.channelId as string).trim() === '') {
+          delete params.args.channelId;
+        }
+      }
+      // 调用原始函数
+      return originalApplyTargetToParams(params);
+    };
+    getLogger()?.warn?.('[DingTalk] Monkey-patched applyTargetToParams to fix empty string bug');
+  }
+} catch (err: any) {
+  getLogger()?.error?.(`[DingTalk] Failed to monkey-patch applyTargetToParams: ${err.message}`);
+}
+
 export const dingtalkPlugin = {
   id: 'dingtalk',
   meta: {
@@ -1280,13 +1306,19 @@ export const dingtalkPlugin = {
   reload: { configPrefixes: ['channels.dingtalk'] },
   actions: {
     handleAction: async (ctx: any) => {
+      // 调试：记录实际收到的参数
+      const log = getLogger();
+      log?.warn?.(`[DingTalk][DEBUG] actions.handleAction called with params: ${JSON.stringify(ctx.params)}`);
+      
       // 清理空的 to/channelId 参数，避免触发 applyTargetToParams 的 legacy 参数检查
       // 这些字段可能被 AI 填充为空字符串，导致 "Use `target` instead of `to`/`channelId`" 错误
       if (ctx.params) {
         if (typeof ctx.params.to === 'string' && ctx.params.to.trim() === '') {
+          log?.warn?.(`[DingTalk][DEBUG] Cleaning empty 'to' parameter`);
           delete ctx.params.to;
         }
         if (typeof ctx.params.channelId === 'string' && ctx.params.channelId.trim() === '') {
+          log?.warn?.(`[DingTalk][DEBUG] Cleaning empty 'channelId' parameter`);
           delete ctx.params.channelId;
         }
       }
@@ -1358,12 +1390,15 @@ export const dingtalkPlugin = {
       return { ok: true, to: resolved };
     },
     sendText: async ({ cfg, to, text, accountId, log }: any) => {
+      console.error(`🚀🚀🚀 [DingTalk] sendText CALLED - to="${to}", text="${text}", accountId="${accountId}"`);
       const config = getConfig(cfg, accountId);
       try {
         const result = await sendMessage(config, to, text, { log, accountId });
+        console.error(`✅ [DingTalk] sendText result: ${JSON.stringify(result)}`);
         getLogger()?.debug?.(`[DingTalk] sendText: "${text}" result: ${JSON.stringify(result)}`);
         return result.ok ? { ok: true, data: result.data } : { ok: false, error: result.error };
       } catch (err: any) {
+        console.error(`❌ [DingTalk] sendText error: ${err.message}`);
         return { ok: false, error: err.response?.data || err.message };
       }
     },
