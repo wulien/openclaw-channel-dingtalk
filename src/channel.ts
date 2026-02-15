@@ -1278,6 +1278,22 @@ export const dingtalkPlugin = {
     outbound: true,
   },
   reload: { configPrefixes: ['channels.dingtalk'] },
+  actions: {
+    handleAction: async (ctx: any) => {
+      // 清理空的 to/channelId 参数，避免触发 applyTargetToParams 的 legacy 参数检查
+      // 这些字段可能被 AI 填充为空字符串，导致 "Use `target` instead of `to`/`channelId`" 错误
+      if (ctx.params) {
+        if (typeof ctx.params.to === 'string' && ctx.params.to.trim() === '') {
+          delete ctx.params.to;
+        }
+        if (typeof ctx.params.channelId === 'string' && ctx.params.channelId.trim() === '') {
+          delete ctx.params.channelId;
+        }
+      }
+      // 返回 null 让官方流程继续处理（通过 outbound.sendText/sendMedia）
+      return null;
+    },
+  },
   config: {
     listAccountIds: (cfg: OpenClawConfig): string[] => {
       const config = getConfig(cfg);
