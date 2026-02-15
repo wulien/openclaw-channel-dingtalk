@@ -1405,10 +1405,12 @@ export const dingtalkPlugin = {
       console.error(`🚀🚀🚀 [DingTalk] sendText CALLED - to="${to}", text="${text}", accountId="${accountId}"`);
       const config = getConfig(cfg, accountId);
       try {
-        const result = await sendMessage(config, to, text, { log, accountId });
-        console.error(`✅ [DingTalk] sendText result: ${JSON.stringify(result)}`);
-        getLogger()?.debug?.(`[DingTalk] sendText: "${text}" result: ${JSON.stringify(result)}`);
-        return result.ok ? { ok: true, data: result.data } : { ok: false, error: result.error };
+        // For proactive messages (outbound.sendText), always use markdown mode
+        // to avoid conflicts with AI Card responses
+        const result = await sendProactiveTextOrMarkdown(config, to, text, { log, accountId });
+        console.error(`✅ [DingTalk] sendText result: success`);
+        getLogger()?.debug?.(`[DingTalk] sendText: "${text}" sent as proactive markdown`);
+        return { ok: true, data: result };
       } catch (err: any) {
         console.error(`❌ [DingTalk] sendText error: ${err.message}`);
         return { ok: false, error: err.response?.data || err.message };
