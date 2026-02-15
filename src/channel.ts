@@ -1255,34 +1255,6 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
 }
 
 // DingTalk Channel Definition
-// Monkey-patch applyTargetToParams to fix empty string bug
-// 这是临时方案，直到 OpenClaw 官方修复此 bug
-try {
-  const channelTargetModule = await import('../../infra/outbound/channel-target.js');
-  if (channelTargetModule && typeof channelTargetModule.applyTargetToParams === 'function') {
-    const originalApplyTargetToParams = channelTargetModule.applyTargetToParams;
-    channelTargetModule.applyTargetToParams = function patchedApplyTargetToParams(params: {
-      action: string;
-      args: Record<string, unknown>;
-    }): void {
-      // 清理空字符串的 to/channelId，避免被误认为 legacy 参数
-      if (params.args) {
-        if (typeof params.args.to === 'string' && params.args.to.trim() === '') {
-          delete params.args.to;
-        }
-        if (typeof params.args.channelId === 'string' && (params.args.channelId as string).trim() === '') {
-          delete params.args.channelId;
-        }
-      }
-      // 调用原始函数
-      return originalApplyTargetToParams(params);
-    };
-    getLogger()?.warn?.('[DingTalk] Monkey-patched applyTargetToParams to fix empty string bug');
-  }
-} catch (err: any) {
-  getLogger()?.error?.(`[DingTalk] Failed to monkey-patch applyTargetToParams: ${err.message}`);
-}
-
 export const dingtalkPlugin = {
   id: 'dingtalk',
   meta: {
@@ -1306,19 +1278,13 @@ export const dingtalkPlugin = {
   reload: { configPrefixes: ['channels.dingtalk'] },
   actions: {
     handleAction: async (ctx: any) => {
-      // 调试：记录实际收到的参数
-      const log = getLogger();
-      log?.warn?.(`[DingTalk][DEBUG] actions.handleAction called with params: ${JSON.stringify(ctx.params)}`);
-      
       // 清理空的 to/channelId 参数，避免触发 applyTargetToParams 的 legacy 参数检查
       // 这些字段可能被 AI 填充为空字符串，导致 "Use `target` instead of `to`/`channelId`" 错误
       if (ctx.params) {
         if (typeof ctx.params.to === 'string' && ctx.params.to.trim() === '') {
-          log?.warn?.(`[DingTalk][DEBUG] Cleaning empty 'to' parameter`);
           delete ctx.params.to;
         }
         if (typeof ctx.params.channelId === 'string' && ctx.params.channelId.trim() === '') {
-          log?.warn?.(`[DingTalk][DEBUG] Cleaning empty 'channelId' parameter`);
           delete ctx.params.channelId;
         }
       }
