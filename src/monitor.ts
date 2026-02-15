@@ -214,6 +214,16 @@ export async function monitorDingTalkStream(opts: DingTalkMonitorOpts): Promise<
             pongReceived = true;
             log?.info?.(`[${accountId}] 🏓 Pong received`);
           });
+
+          // Add error and close event listeners for debugging
+          ws.on('error', (err: any) => {
+            log?.error?.(`[${accountId}] 🔴 WebSocket error: ${err.message}`);
+          });
+
+          ws.on('close', (code: number, reason: string) => {
+            log?.warn?.(`[${accountId}] 🔌 WebSocket closed: code=${code}, reason=${reason || 'none'}`);
+          });
+
           log?.info?.(`[${accountId}] 🏓 Ping/pong listener attached to WebSocket`);
         } else {
           log?.warn?.(`[${accountId}] ⚠️ Could not access underlying WebSocket for ping/pong`);
