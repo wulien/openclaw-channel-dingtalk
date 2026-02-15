@@ -224,6 +224,13 @@ export async function monitorDingTalkStream(opts: DingTalkMonitorOpts): Promise<
             log?.warn?.(`[${accountId}] 🔌 WebSocket closed: code=${code}, reason=${reason || 'none'}`);
           });
 
+          // Add message event listener to detect any WebSocket activity
+          ws.on('message', (data: any) => {
+            const now = Date.now();
+            const timeSinceLastMsg = lastMessageAt ? now - lastMessageAt : 0;
+            log?.debug?.(`[${accountId}] 📡 WebSocket message received (${timeSinceLastMsg}ms since last message)`);
+          });
+
           log?.info?.(`[${accountId}] 🏓 Ping/pong listener attached to WebSocket`);
         } else {
           log?.warn?.(`[${accountId}] ⚠️ Could not access underlying WebSocket for ping/pong`);
