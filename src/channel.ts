@@ -1133,12 +1133,46 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
     }
   }
 
+  // Add timeout protection for AI processing
+  const AI_RESPONSE_TIMEOUT_MS = 120000; // 2 minutes timeout
+  let timeoutHandle: NodeJS.Timeout | null = null;
+  let hasTimedOut = false;
+
+  if (useCardMode && currentAICard) {
+    timeoutHandle = setTimeout(async () => {
+      if (currentAICard && !isCardInTerminalState(currentAICard.state)) {
+        hasTimedOut = true;
+        log?.warn?.('[DingTalk] AI response timeout (2 minutes), closing card with error message');
+
+        try {
+          // Close the card with error message
+          await streamAICard(currentAICard, '⚠️ AI 响应超时，请稍后重试', true, log);
+          currentAICard.state = AICardStatus.FAILED;
+          currentAICard.lastUpdated = Date.now();
+          activeCardsByTarget.delete(`${accountId}:${to}`);
+        } catch (err: any) {
+          log?.error?.(`[DingTalk] Failed to close timed-out card: ${err.message}`);
+        }
+      }
+    }, AI_RESPONSE_TIMEOUT_MS);
+  }
+
   const { queuedFinal } = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx,
     cfg,
     dispatcherOptions: {
       responsePrefix: '',
       deliver: async (payload: any) => {
+        // Clear timeout on first response
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle);
+          timeoutHandle = null;
+        }
+
+        if (hasTimedOut) {
+          log?.debug?.('[DingTalk] Ignoring response after timeout');
+          return;
+        }
         try {
           const textToSend = payload.markdown || payload.text;
           if (!textToSend) return;
@@ -1187,6 +1221,18 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
       },
     },
   });
+
+  // Clear timeout if still active
+  if (timeoutHandle) {
+    clearTimeout(timeoutHandle);
+    timeoutHandle = null;
+  }
+
+  // If timed out, skip finalization
+  if (hasTimedOut) {
+    log?.warn?.('[DingTalk] Skipping finalization due to timeout');
+    return;
+  }
 
   // Finalize AI card
   if (useCardMode && currentAICard) {
