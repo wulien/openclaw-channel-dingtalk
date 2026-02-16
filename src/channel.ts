@@ -1137,32 +1137,44 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
   const AI_RESPONSE_TIMEOUT_MS = 300000; // 5 minutes timeout
   let timeoutHandle: NodeJS.Timeout | null = null;
   let hasTimedOut = false;
+  let hasReceivedResponse = false;
 
   if (useCardMode && currentAICard) {
     timeoutHandle = setTimeout(async () => {
-      if (currentAICard && !isCardInTerminalState(currentAICard.state)) {
+      if (currentAICard && !isCardInTerminalState(currentAICard.state) && !hasReceivedResponse) {
         hasTimedOut = true;
-        log?.warn?.('[DingTalk] AI response timeout (5 minutes), closing card with error message');
+        log?.warn?.('[DingTalk] AI response timeout (1 minute), closing card with error message');
 
         try {
           // Close the card with error message
-          await streamAICard(currentAICard, '⚠️ AI 响应超时，请稍后重试', true, log);
+          await streamAICard(currentAICard, '⚠️ AI 响应超时 (1分钟)，请稍后重试', true, log);
           currentAICard.state = AICardStatus.FAILED;
           currentAICard.lastUpdated = Date.now();
-          activeCardsByTarget.delete(`${accountId}:${to}`);
+          // Clean up active card to allow new requests
+          const targetKey = `${accountId}:${to}`;
+          activeCardsByTarget.delete(targetKey);
+          log?.debug?.(`[DingTalk] Cleaned up timed-out card for ${targetKey}`);
         } catch (err: any) {
           log?.error?.(`[DingTalk] Failed to close timed-out card: ${err.message}`);
+          // Force cleanup even if closing failed
+          const targetKey = `${accountId}:${to}`;
+          activeCardsByTarget.delete(targetKey);
         }
       }
     }, AI_RESPONSE_TIMEOUT_MS);
   }
 
-  const { queuedFinal } = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+  let dispatchResult: any;
+  try {
+    dispatchResult = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx,
     cfg,
     dispatcherOptions: {
       responsePrefix: '',
       deliver: async (payload: any) => {
+        // Mark that we've received a response
+        hasReceivedResponse = true;
+
         // Clear timeout on first response
         if (timeoutHandle) {
           clearTimeout(timeoutHandle);
@@ -1221,6 +1233,35 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
       },
     },
   });
+  } catch (dispatchErr: any) {
+    // If dispatch fails, clean up timeout and card state
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+      timeoutHandle = null;
+    }
+
+    log?.error?.(`[DingTalk] Dispatch failed: ${dispatchErr.message}`);
+
+    // Clean up card state on dispatch failure
+    if (useCardMode && currentAICard) {
+      const targetKey = `${accountId}:${to}`;
+      try {
+        await streamAICard(currentAICard, `⚠️ 处理失败: ${dispatchErr.message}`, true, log);
+        currentAICard.state = AICardStatus.FAILED;
+        currentAICard.lastUpdated = Date.now();
+        activeCardsByTarget.delete(targetKey);
+        log?.debug?.(`[DingTalk] Cleaned up failed card for ${targetKey}`);
+      } catch (cleanupErr: any) {
+        log?.error?.(`[DingTalk] Failed to clean up card: ${cleanupErr.message}`);
+        // Force cleanup
+        activeCardsByTarget.delete(targetKey);
+      }
+    }
+
+    throw dispatchErr;
+  }
+
+  const { queuedFinal } = dispatchResult;
 
   // Clear timeout if still active
   if (timeoutHandle) {
@@ -1250,6 +1291,9 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
         const finalContent = hasLastCardContent ? lastCardContent : (queuedFinal as string);
         try {
           await finishAICard(currentAICard, finalContent, log);
+          // Successfully finished, clean up active card
+          activeCardsByTarget.delete(targetKey);
+          log?.debug?.(`[DingTalk] Successfully finished and cleaned up card for ${targetKey}`);
         } catch (finishErr: any) {
           safeLogError(log, `[AICard] Finalization failed: ${finishErr.message}`);
           // Attempt to notify user about the failure with fallback message
@@ -1264,18 +1308,21 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
         }
       } else {
         // No textual content was produced; still need to close the card to prevent spinning
-        log?.debug?.(
-          '[DingTalk] No textual content produced, closing card with placeholder'
+        log?.warn?.(
+          '[DingTalk] No textual content produced, this indicates AI processing failed silently'
         );
         try {
           // Send a finalize message to close the streaming channel
-          await streamAICard(currentAICard, '处理完成', true, log);
+          await streamAICard(currentAICard, '⚠️ AI 处理异常，未产生任何响应。请重试。', true, log);
         } catch (finalizeErr: any) {
           log?.warn?.(`[DingTalk] Failed to close empty card: ${finalizeErr.message}`);
         }
-        // Always update state to FINISHED
+        // Always update state to FINISHED and clean up
         currentAICard.state = AICardStatus.FINISHED;
         currentAICard.lastUpdated = Date.now();
+        // Clean up active card to allow new requests
+        activeCardsByTarget.delete(targetKey);
+        log?.debug?.(`[DingTalk] Cleaned up empty-content card for ${targetKey}`);
       }
     } catch (err: any) {
       const errorMsg = `AI Card finalization failed: ${err.message}`;
