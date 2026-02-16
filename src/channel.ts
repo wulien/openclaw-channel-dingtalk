@@ -1133,59 +1133,38 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
     }
   }
 
-  // Add timeout protection for AI processing
-  // Match OpenClaw's default agent timeout (600 seconds = 10 minutes)
-  const AI_RESPONSE_TIMEOUT_MS = 600000; // 10 minutes timeout
-  let timeoutHandle: NodeJS.Timeout | null = null;
-  let hasTimedOut = false;
-  let hasReceivedResponse = false;
+  // UI-only timeout hint for AI Card - does NOT interfere with OpenClaw's dispatch/session flow.
+  // OpenClaw manages its own agent timeout (default 600s). We only update the card UI to
+  // let the user know processing is taking long. The dispatch continues normally.
+  const AI_CARD_HINT_TIMEOUT_MS = 120000; // Show hint after 2 minutes
+  let hintTimeoutHandle: NodeJS.Timeout | null = null;
 
   if (useCardMode && currentAICard) {
-    timeoutHandle = setTimeout(async () => {
-      if (currentAICard && !isCardInTerminalState(currentAICard.state) && !hasReceivedResponse) {
-        hasTimedOut = true;
-        log?.warn?.('[DingTalk] AI response timeout (1 minute), closing card with error message');
-
-        try {
-          // Close the card with error message
-          await streamAICard(currentAICard, '⚠️ AI 响应超时 (1分钟)，请稍后重试', true, log);
-          currentAICard.state = AICardStatus.FAILED;
-          currentAICard.lastUpdated = Date.now();
-          // Clean up active card to allow new requests
-          const targetKey = `${accountId}:${to}`;
-          activeCardsByTarget.delete(targetKey);
-          log?.debug?.(`[DingTalk] Cleaned up timed-out card for ${targetKey}`);
-        } catch (err: any) {
-          log?.error?.(`[DingTalk] Failed to close timed-out card: ${err.message}`);
-          // Force cleanup even if closing failed
-          const targetKey = `${accountId}:${to}`;
-          activeCardsByTarget.delete(targetKey);
+    hintTimeoutHandle = setTimeout(async () => {
+      try {
+        if (currentAICard && !isCardInTerminalState(currentAICard.state)) {
+          log?.warn?.('[DingTalk] AI processing taking long, updating card with hint');
+          // Only update the card content as a hint - do NOT close it, do NOT change state
+          await streamAICard(currentAICard, '⏳ AI 正在处理中，请耐心等待...', false, log);
         }
+      } catch (err: any) {
+        log?.debug?.(`[DingTalk] Failed to update card with hint: ${err.message}`);
       }
-    }, AI_RESPONSE_TIMEOUT_MS);
+    }, AI_CARD_HINT_TIMEOUT_MS);
   }
 
-  let dispatchResult: any;
-  try {
-    dispatchResult = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+  const { queuedFinal } = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx,
     cfg,
     dispatcherOptions: {
       responsePrefix: '',
       deliver: async (payload: any) => {
-        // Mark that we've received a response
-        hasReceivedResponse = true;
-
-        // Clear timeout on first response
-        if (timeoutHandle) {
-          clearTimeout(timeoutHandle);
-          timeoutHandle = null;
+        // Clear hint timeout on first response
+        if (hintTimeoutHandle) {
+          clearTimeout(hintTimeoutHandle);
+          hintTimeoutHandle = null;
         }
 
-        if (hasTimedOut) {
-          log?.debug?.('[DingTalk] Ignoring response after timeout');
-          return;
-        }
         try {
           const textToSend = payload.markdown || payload.text;
           if (!textToSend) return;
@@ -1234,46 +1213,11 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
       },
     },
   });
-  } catch (dispatchErr: any) {
-    // If dispatch fails, clean up timeout and card state
-    if (timeoutHandle) {
-      clearTimeout(timeoutHandle);
-      timeoutHandle = null;
-    }
 
-    log?.error?.(`[DingTalk] Dispatch failed: ${dispatchErr.message}`);
-
-    // Clean up card state on dispatch failure
-    if (useCardMode && currentAICard) {
-      const targetKey = `${accountId}:${to}`;
-      try {
-        await streamAICard(currentAICard, `⚠️ 处理失败: ${dispatchErr.message}`, true, log);
-        currentAICard.state = AICardStatus.FAILED;
-        currentAICard.lastUpdated = Date.now();
-        activeCardsByTarget.delete(targetKey);
-        log?.debug?.(`[DingTalk] Cleaned up failed card for ${targetKey}`);
-      } catch (cleanupErr: any) {
-        log?.error?.(`[DingTalk] Failed to clean up card: ${cleanupErr.message}`);
-        // Force cleanup
-        activeCardsByTarget.delete(targetKey);
-      }
-    }
-
-    throw dispatchErr;
-  }
-
-  const { queuedFinal } = dispatchResult;
-
-  // Clear timeout if still active
-  if (timeoutHandle) {
-    clearTimeout(timeoutHandle);
-    timeoutHandle = null;
-  }
-
-  // If timed out, skip finalization
-  if (hasTimedOut) {
-    log?.warn?.('[DingTalk] Skipping finalization due to timeout');
-    return;
+  // Clear hint timeout after dispatch completes
+  if (hintTimeoutHandle) {
+    clearTimeout(hintTimeoutHandle);
+    hintTimeoutHandle = null;
   }
 
   // Finalize AI card
@@ -1308,37 +1252,31 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
           }
         }
       } else {
-        // No textual content was produced; still need to close the card to prevent spinning
+        // No textual content was produced - OpenClaw agent timed out or failed silently
         log?.warn?.(
-          '[DingTalk] No textual content produced, this indicates AI processing failed silently'
+          '[DingTalk] No textual content produced, closing card with timeout message'
         );
         try {
-          // Send a finalize message to close the streaming channel
-          await streamAICard(currentAICard, '⚠️ AI 处理异常，未产生任何响应。请重试。', true, log);
+          await streamAICard(currentAICard, '⚠️ AI 处理超时，未产生响应。请重试。', true, log);
         } catch (finalizeErr: any) {
           log?.warn?.(`[DingTalk] Failed to close empty card: ${finalizeErr.message}`);
         }
-        // Always update state to FINISHED and clean up
         currentAICard.state = AICardStatus.FINISHED;
         currentAICard.lastUpdated = Date.now();
-        // Clean up active card to allow new requests
         activeCardsByTarget.delete(targetKey);
         log?.debug?.(`[DingTalk] Cleaned up empty-content card for ${targetKey}`);
       }
     } catch (err: any) {
       const errorMsg = `AI Card finalization failed: ${err.message}`;
       safeLogError(log, errorMsg);
-      // Ensure the AI card transitions to a terminal error state
       try {
         if (currentAICard.state !== AICardStatus.FINISHED) {
           currentAICard.state = AICardStatus.FAILED;
           currentAICard.lastUpdated = Date.now();
         }
-        // Clean up active card mapping to prevent reuse of failed cards
         activeCardsByTarget.delete(targetKey);
         log?.debug?.(`[DingTalk] Cleaned up failed card mapping: ${targetKey}`);
       } catch (stateErr: any) {
-        // Log state update failure at debug level to aid production debugging
         log?.debug?.(`[DingTalk] Failed to update card state to FAILED: ${stateErr.message}`);
         console.error(`[DingTalk] Failed to update card state:`, stateErr);
       }
