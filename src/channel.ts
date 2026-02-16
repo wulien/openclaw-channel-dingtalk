@@ -1134,7 +1134,8 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
   }
 
   // Add timeout protection for AI processing
-  const AI_RESPONSE_TIMEOUT_MS = 300000; // 5 minutes timeout
+  // Match OpenClaw's default agent timeout (600 seconds = 10 minutes)
+  const AI_RESPONSE_TIMEOUT_MS = 600000; // 10 minutes timeout
   let timeoutHandle: NodeJS.Timeout | null = null;
   let hasTimedOut = false;
   let hasReceivedResponse = false;
@@ -1454,7 +1455,7 @@ export const dingtalkPlugin = {
       try {
         // For proactive messages (outbound.sendText), always use markdown mode
         // to avoid conflicts with AI Card responses
-        const result = await sendProactiveTextOrMarkdown(config, to, text, { log, accountId });
+        const result = await sendProactiveTextOrMarkdown(config, to, text, { log });
         console.error(`✅ [DingTalk] sendText result: success`);
         getLogger()?.debug?.(`[DingTalk] sendText: "${text}" sent as proactive markdown`);
         return { ok: true, data: result };
