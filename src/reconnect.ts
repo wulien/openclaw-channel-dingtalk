@@ -8,7 +8,7 @@ export type ReconnectPolicy = {
   maxAttempts: number;
 };
 
-export const DEFAULT_HEARTBEAT_SECONDS = 60;
+export const DEFAULT_HEARTBEAT_SECONDS = 30;
 export const DEFAULT_RECONNECT_POLICY: ReconnectPolicy = {
   initialMs: 2_000,      // Initial delay: 2 seconds
   maxMs: 30_000,         // Max delay: 30 seconds

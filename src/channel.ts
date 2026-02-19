@@ -1421,8 +1421,9 @@ export const dingtalkPlugin = {
 
       ctx.log?.info?.(`[${account.accountId}] Starting DingTalk Stream with robust reconnection...`);
 
-      // Start monitoring in background with reconnection management
-      const monitorPromise = monitorDingTalkStream({
+      // Start monitoring - this will block until abortSignal is triggered
+      // This prevents OpenClaw's auto-restart mechanism from creating duplicate connections
+      await monitorDingTalkStream({
         cfg,
         accountId: account.accountId,
         config,
@@ -1430,13 +1431,12 @@ export const dingtalkPlugin = {
         log: ctx.log,
       });
 
-      let stopped = false;
+      ctx.log?.info?.(`[${account.accountId}] DingTalk Stream monitor completed`);
+
       return {
         stop: () => {
-          if (stopped) return;
-          stopped = true;
-          ctx.log?.info?.(`[${account.accountId}] DingTalk provider stop requested`);
-          // Monitor will stop via abortSignal
+          ctx.log?.info?.(`[${account.accountId}] DingTalk provider stopped`);
+          // Monitor already stopped via abortSignal
         },
       };
     },
